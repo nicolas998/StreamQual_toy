@@ -11,5 +11,8 @@ venv/
 # Local copy of the RNSTM publication (García-Múnera et al., 2026)
 J American Water Resour Assoc - *.pdf
 
+# Local reference documents
+FDEP_SWIL5_LET_PreDevelopment_Memo_Final_2025-09.pdf
+
 # Local editor settings
 .vscode/

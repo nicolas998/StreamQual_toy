@@ -5,11 +5,11 @@ script) can pick and compare them interchangeably::
 
     from models import get_model, simulate
     model = get_model("RNSTM")
-    res = simulate(model, forcing, reach=(1.2, 0.2, 0.1), y0=(28.0,))
+    res = simulate(model, forcing, reach=(1.2, 0.2, 0.1, 5.0, 0.5), y0=(28.0,))
 
-A model simulates one **constituent** (water temperature now; salinity,
-dissolved oxygen, ... later). The constituent carries what the app needs to
-plot it and to compare it with a USGS gauge (unit, parameter code).
+A model simulates one **constituent** (water temperature, salinity; dissolved
+oxygen, ... later). The constituent carries what the app needs to plot it and
+to compare it with a USGS gauge (unit, parameter code, unit conversion).
 
 Adding a new model
 ------------------
@@ -26,8 +26,8 @@ RHS contract
 ------------
 * ``t``              : time [min] since the start of the run
 * ``y``              : state vector, length ``dim``
-* ``params``         : per-reach params (:data:`REACH_PARAMS`), as asynch's
-                       local params -> [c_depth, f_depth, d_min]
+* ``params``         : per-reach params (:data:`REACH_PARAMS`)
+                       -> [c_depth, f_depth, d_min, c_width, f_width]
 * ``global_params``  : the model's parameter vector (``model.params``)
 * ``forcing``        : callable ``forcing(t) -> forcings.ForcingSample``
 """
@@ -52,12 +52,22 @@ class Constituent:
     usgs_pcode: str          # USGS parameter code of the observation
     obs_column: str          # its column in usgs.instantaneous_values()
     rel_error_floor: float   # |obs| below this is left out of relative errors
+    obs_factor: float = 1.0  # observation [gauge unit] * obs_factor -> unit
+    obs_note: str = ""       # how the observation is converted, for the app
 
 
 TEMPERATURE = Constituent("temperature", "Water temperature", "°C",
                           usgs_pcode="00010", obs_column="water_temp",
                           rel_error_floor=0.5)
-CONSTITUENTS = {c.key: c for c in (TEMPERATURE,)}
+# Salinity as total dissolved solids, the units of the salt routing scheme.
+# USGS reports specific conductance at 25 degC (00095); TDS ~ 0.65 SC is the
+# usual conversion (0.55-0.75 depending on the ions).
+SALINITY = Constituent("salinity", "Salinity (TDS)", "mg/L",
+                       usgs_pcode="00095", obs_column="spec_cond",
+                       rel_error_floor=1.0, obs_factor=0.65,
+                       obs_note="TDS = 0.65 × USGS specific conductance "
+                                "at 25 °C [µS/cm]")
+CONSTITUENTS = {c.key: c for c in (TEMPERATURE, SALINITY)}
 
 
 @dataclass(frozen=True)
@@ -67,17 +77,26 @@ class Param:
     default: float
     help: str = ""
     advanced: bool = False   # physical constants: hidden by default in the app
+    # The app sets it to the initial state (the gauge's first observation)
+    # whenever the gauge or the window changes, e.g. an inflow concentration.
+    follows_initial: bool = False
 
 
-# Per-reach parameters, shared by every model: hydraulic-geometry depth
-# d = max(c_depth * Q**f_depth, d_min) (RNSTM local params 3, 4 in asynch).
+# Per-reach parameters, shared by every model: hydraulic geometry
+# d = max(c_depth * Q**f_depth, d_min) (RNSTM local params 3, 4 in asynch) and
+# w = c_width * Q**f_width (used by the salinity model for the reach volume).
 REACH_PARAMS = (
     Param("c_depth", "m/(m³/s)^f", 0.30,
           "Depth coefficient of d = c_depth·Q^f_depth."),
     Param("f_depth", "-", 0.40,
           "Depth exponent of d = c_depth·Q^f_depth (0.3–0.5 is typical)."),
     Param("d_min", "m", 0.10, "Minimum depth (asynch uses 0.1 m)."),
+    Param("c_width", "m/(m³/s)^f", 5.0,
+          "Width coefficient of w = c_width·Q^f_width."),
+    Param("f_width", "-", 0.50,
+          "Width exponent of w = c_width·Q^f_width (about 0.5 is typical)."),
 )
+W_MIN = 0.1            # minimum reach width [m]
 
 
 @dataclass(frozen=True)
@@ -94,11 +113,15 @@ class WQModel:
     # sign +1 = gain, -1 = loss of the state.
     budget: Tuple[Tuple[str, str, int], ...] = ()
     budget_unit: str = ""
+    budget_title: str = ""
     # Equations, for display: ((LaTeX lhs, LaTeX rhs), ...)
     equations: Tuple[Tuple[str, str], ...] = ()
     definitions: Tuple[Tuple[str, str], ...] = ()
+    notation: str = ""                    # symbols and units of the equations
     # Forcing fields the model reads (the app checks they have no gaps).
     forcings: Tuple[str, ...] = ()
+    # summary(fluxes) -> one sentence about a run, under the budget plot
+    summary: Optional[Callable] = None
 
     @property
     def dim(self):
@@ -113,16 +136,18 @@ MODELS = {}
 
 
 def register_model(name, constituent, state_names, params, fluxes,
-                   description="", budget=(), budget_unit="", equations=(),
-                   definitions=(), forcings=()):
+                   description="", budget=(), budget_unit="", budget_title="",
+                   equations=(), definitions=(), notation="", forcings=(),
+                   summary=None):
     """Decorator: register a dydt function as a named model."""
     def deco(fn):
         MODELS[name] = WQModel(
             name=name, constituent=constituent, dydt=fn, fluxes=fluxes,
             state_names=tuple(state_names), params=tuple(params),
             description=description, budget=tuple(budget),
-            budget_unit=budget_unit, equations=tuple(equations),
-            definitions=tuple(definitions), forcings=tuple(forcings))
+            budget_unit=budget_unit, budget_title=budget_title,
+            equations=tuple(equations), definitions=tuple(definitions),
+            notation=notation, forcings=tuple(forcings), summary=summary)
         return fn
     return deco
 
@@ -136,8 +161,14 @@ def get_model(name):
 
 def reach_depth(q, params):
     """Hydraulic-geometry depth [m] for streamflow ``q`` [m^3/s]."""
-    c_depth, f_depth, d_min = params
+    c_depth, f_depth, d_min = params[:3]
     return max(c_depth * max(q, 0.0) ** f_depth, d_min)
+
+
+def reach_width(q, params):
+    """Hydraulic-geometry width [m] for streamflow ``q`` [m^3/s]."""
+    c_width, f_width = params[3:5]
+    return max(c_width * max(q, 0.0) ** f_width, W_MIN)
 
 
 def flux_timeseries(model, t, y, params, global_params, forcing):
@@ -166,7 +197,8 @@ def simulate(model, forcing, reach, y0, global_params=None, t_end=None,
     ----------
     model : WQModel
     forcing : forcings.HourlyForcing
-    reach : (c_depth, f_depth, d_min), see :data:`REACH_PARAMS`
+    reach : (c_depth, f_depth, d_min, c_width, f_width), see
+        :data:`REACH_PARAMS`
     y0 : initial state, length ``model.dim``
     global_params : the model's parameters; defaults to its defaults
     t_end : simulation length [min]; defaults to the end of the forcing
@@ -340,6 +372,20 @@ TEMPERATURE_DEFINITIONS = (
     (r"m,\ a", r"\text{calib\_m},\ \text{calib\_a}"),
 )
 
+TEMPERATURE_NOTATION = (
+    "T_w, T_a: water and air temperature [°C]; R_sw, R_lw: incoming short- "
+    "and long-wave radiation [W/m²]; RH: relative humidity [0–1]; C: cloud "
+    "cover [0–1]; W₂: wind at 2 m [m/s]; p_a: pressure [mbar]; P: "
+    "precipitation [m/s]; Q: streamflow [m³/s]; H terms in W/m².")
+
+
+def _temperature_summary(f):
+    return (f"Positive = heat into the water. Mean evaporation "
+            f"{np.mean(f['evap_mm_d']):.2f} mm/day; mean warming rate "
+            f"{np.mean(f['dTdt_day']):+.3f} °C/day over a depth of "
+            f"{np.mean(f['depth']):.2f} m.")
+
+
 _fluxes_rnstm = _make_temperature_fluxes(longwave_from_forcing=False)
 _fluxes_rnstm_lw = _make_temperature_fluxes(longwave_from_forcing=True)
 
@@ -351,6 +397,8 @@ register_model(
                 "from air temperature, humidity and cloud cover), evaporation, "
                 "convection and rain mixing, over a depth d = c_depth·Q^f_depth.",
     budget=TEMPERATURE_BUDGET, budget_unit="W/m²",
+    budget_title="Heat flux into the water", notation=TEMPERATURE_NOTATION,
+    summary=_temperature_summary,
     equations=TEMPERATURE_EQUATIONS, definitions=TEMPERATURE_DEFINITIONS,
     forcings=("sw_down", "t_air", "rh", "cloud", "wind2", "pressure", "rain"),
 )(_temperature_dydt(_fluxes_rnstm))
@@ -362,6 +410,8 @@ register_model(
                 "the forcing data (NASA POWER ALLSKY_SFC_LW_DWN) instead of "
                 "the emissivity formula; cloud cover is then not used.",
     budget=TEMPERATURE_BUDGET, budget_unit="W/m²",
+    budget_title="Heat flux into the water", notation=TEMPERATURE_NOTATION,
+    summary=_temperature_summary,
     equations=(TEMPERATURE_EQUATIONS[:2]
                + ((r"H_l", r"0.97\,R_{lw} - 0.97\,\sigma\,(T_w + 273.2)^4"),)
                + TEMPERATURE_EQUATIONS[3:]),
@@ -369,3 +419,145 @@ register_model(
     forcings=("sw_down", "lw_down", "t_air", "rh", "wind2", "pressure",
               "rain"),
 )(_temperature_dydt(_fluxes_rnstm_lw))
+
+
+# ----------------------------------------------------------------------------
+# Salinity -- lumped salt routing of one reach (Davidson & Salbe, IQQM
+# salinity routing upgrade; port of salt_segment.py)
+# ----------------------------------------------------------------------------
+# The reach is a fully mixed store (CSTR) of volume V and salt mass M = c V:
+#     dM/dt = Q_in c_in + L - Q_out M / V          (Davidson eq. 1)
+# For a single reach the storage follows the hydraulic geometry, V = w d L_reach
+# at the current Q, and is held constant within a step (dV/dt = 0), so the
+# outflow is Q_out = Q_in - Q_ev and the state is the concentration c = M / V:
+#     V dc/dt = Q (c_bf - c) + Q_qf (c_qf - c) + Q_ev c + L
+# Inflows are two end members (mix_end_members): the upstream flow Q at the
+# baseflow concentration c_bf and the rain-driven quickflow Q_qf = k_rain P A_s
+# at c_qf. Evaporation Q_ev = E A_s removes water but not salt; it uses the
+# mass-transfer formula of RNSTM at the air temperature, since this model has
+# no water temperature. Dry reaches cannot occur: V >= d_min w L_reach > 0.
+def mix_end_members(q_bf, c_bf, q_qf, c_qf):
+    """Two-end-member inflow concentration (baseflow + quickflow/lateral)."""
+    q = q_bf + q_qf
+    if q <= 0:
+        return 0.0
+    return (q_bf * c_bf + q_qf * c_qf) / q
+
+
+def ec25_from_measured(ec_measured, temp_c, alpha=0.02):
+    """Temperature-compensate electrical conductivity to 25 degC.
+
+    USGS specific conductance (00095) is already at 25 degC; use this for
+    uncompensated EC records before comparing them with the model.
+    """
+    return ec_measured / (1.0 + alpha * (temp_c - 25.0))
+
+
+def fluxes_salt(t, y, params, global_params, forcing):
+    L_reach, c_bf, c_qf, k_rain, load, a_w, b_w = global_params
+    f = forcing(t)
+    c = y[0]
+
+    q = max(f.q, 0.0)
+    depth = reach_depth(q, params)
+    width = reach_width(q, params)
+    area = width * L_reach                       # water surface A_s [m^2]
+    V = area * depth                             # reach volume [m^3]
+
+    q_qf = k_rain * f.rain * (1e-3 / 3600.0) * area       # mm/h -> m3/s
+    rh = min(f.rh, 100.0) * 0.01
+    evap = max((a_w + b_w * f.wind2) * _e_sat(f.t_air) * (1.0 - rh), 0.0)
+    q_ev = evap * area                           # [m^3/s]
+    q_in = q + q_qf
+    q_out = max(q_in - q_ev, 0.0)
+    c_in = mix_end_members(q, c_bf, q_qf, c_qf)
+
+    per_day = 86400.0 / V                        # (g/s) / V -> mg/L per day
+    adv = q * (c_bf - c) * per_day
+    rain = q_qf * (c_qf - c) * per_day
+    evap_term = (q_in - q_out) * c * per_day
+    load_term = load * per_day
+    return {
+        "adv": adv, "rain": rain, "evap": evap_term, "load": load_term,
+        "dcdt_day": adv + rain + evap_term + load_term,
+        "c_in": c_in, "q_qf": q_qf, "q_out": q_out,
+        "evap_mm_d": evap * 1000.0 * 86400.0,
+        "depth": depth, "width": width, "volume": V,
+        "tau_h": V / max(q_out, 1e-9) / 3600.0,
+    }
+
+
+def model_salt(t, y, params, global_params, forcing):
+    rate = fluxes_salt(t, y, params, global_params, forcing)["dcdt_day"] / 1440.0
+    if y[0] <= 0.0 and rate < 0.0:               # no negative concentrations
+        rate = 0.0
+    return [rate]
+
+
+SALT_PARAMS = (
+    Param("L_reach", "m", 1000.0,
+          "Reach length. With the width and depth it sets the volume "
+          "V = w·d·L_reach and the water surface A_s = w·L_reach."),
+    Param("c_bf", "mg/L", 500.0,
+          "Baseflow end member: concentration of the upstream inflow Q. "
+          "The app sets it to the initial concentration for each gauge.",
+          follows_initial=True),
+    Param("c_qf", "mg/L", 20.0,
+          "Quickflow end member: concentration of the rain-driven inflow."),
+    Param("k_rain", "-", 1.0,
+          "Rain-driven inflow per unit of water surface, as a multiple of "
+          "the rainfall (as in RNSTM). 1 = only rain falling on the water."),
+    Param("load", "g/s", 0.0,
+          "Net external salt load L (groundwater, tidal, point sources); "
+          "negative for a withdrawal."),
+    Param("a_w", "m/(s·mbar)", 1.505e-9,
+          "Wind-function intercept of evaporation, as in RNSTM.", advanced=True),
+    Param("b_w", "1/mbar", 1.6e-9,
+          "Wind-function slope of evaporation, as in RNSTM.", advanced=True),
+)
+
+
+def _salt_summary(f):
+    return (f"Positive = concentration rising. Mean residence time "
+            f"{np.mean(f['tau_h']):.1f} h in a reach of "
+            f"{np.mean(f['volume']):,.0f} m³ ({np.mean(f['width']):.1f} m wide, "
+            f"{np.mean(f['depth']):.2f} m deep); mean inflow concentration "
+            f"{np.mean(f['c_in']):.0f} mg/L; mean evaporation "
+            f"{np.mean(f['evap_mm_d']):.2f} mm/day.")
+
+
+register_model(
+    "SaltCSTR", SALINITY, state_names=("c",),
+    params=SALT_PARAMS, fluxes=fluxes_salt,
+    description="Lumped salt routing (Davidson & Salbe, IQQM): the reach is a "
+                "fully mixed store fed by the upstream flow at the baseflow "
+                "concentration and by rain-driven quickflow at the quickflow "
+                "concentration, concentrated by evaporation, plus an external "
+                "load.",
+    budget=(("adv", "Upstream inflow", +1), ("rain", "Rain dilution", +1),
+            ("evap", "Evaporation", +1), ("load", "External load", +1)),
+    budget_unit="mg/L/day", budget_title="Rate of change of c",
+    equations=(
+        (r"\frac{dc}{dt}",
+         r"\frac{Q\,(c_{bf} - c) + Q_{qf}\,(c_{qf} - c) + Q_{ev}\,c + L}{V}"),
+        (r"V", r"w\,d\,L_{reach},\qquad A_s = w\,L_{reach}"),
+        (r"Q_{qf}", r"k_{rain}\,P\,A_s"),
+        (r"Q_{ev}", r"E\,A_s,\qquad E = f(W)\,\left(e_s(T_a) - e_a\right)"),
+        (r"c_{in}", r"\frac{Q\,c_{bf} + Q_{qf}\,c_{qf}}{Q + Q_{qf}}"),
+        (r"w,\ d", r"c_{width}\,Q^{f_{width}},\quad "
+                   r"\max\left(c_{depth}\,Q^{f_{depth}},\ d_{min}\right)"),
+    ),
+    definitions=(
+        (r"e_s(T)", r"6.1275\,\exp\left(\frac{17.27\,T}{237.3 + T}\right)"
+                    r"\ \text{[mbar]},\quad e_a = RH\,e_s(T_a)"),
+        (r"f(W)", r"a_w + b_w\,W_2"),
+    ),
+    notation="c: salt concentration as TDS [mg/L]; Q: upstream streamflow "
+             "[m³/s]; Q_qf, Q_ev: rain-driven inflow and evaporation [m³/s]; "
+             "P: precipitation [m/s]; E: evaporation rate [m/s]; L: external "
+             "load [g/s]; w, d, L_reach: reach width, depth and length [m]; "
+             "T_a: air temperature [°C]; RH: relative humidity [0–1]; W₂: "
+             "wind at 2 m [m/s].",
+    forcings=("t_air", "rh", "wind2", "rain"),
+    summary=_salt_summary,
+)(model_salt)

@@ -2,13 +2,16 @@
 
 * :func:`site_info`            -- name, location, drainage area, time zone.
 * :func:`find_gauges`          -- stream gauges of a state that report water
-                                  temperature, with their period of record.
-* :func:`instantaneous_values` -- discharge, gage height, mean depth and water
-                                  temperature, converted to SI and averaged to
-                                  hourly values on a UTC index.
+                                  temperature and/or specific conductance,
+                                  with their periods of record.
+* :func:`instantaneous_values` -- discharge, gage height, mean depth, water
+                                  temperature and specific conductance,
+                                  converted to SI and averaged to hourly
+                                  values on a UTC index.
 * :func:`channel_measurements` -- USGS field measurements (Q, width, area),
                                   giving the mean depth ``d = area / width``.
-* :func:`fit_depth_rating`     -- fit ``d = c_depth * Q**f_depth`` to them.
+* :func:`fit_hydraulic_geometry` -- fit ``d = c_depth * Q**f_depth`` and
+                                  ``w = c_width * Q**f_width`` to them.
 
 Instantaneous values and site metadata come from the NWIS Water Services
 (waterservices.usgs.gov); channel measurements from the Water Data OGC API
@@ -34,6 +37,7 @@ PCODES = {
     "00065": ("gage_height", FT),       # ft     -> m
     "00064": ("mean_depth", FT),        # ft     -> m
     "00010": ("water_temp", 1.0),       # degC
+    "00095": ("spec_cond", 1.0),        # uS/cm at 25 degC
 }
 # Standard-time UTC offsets [h] of the USGS tz_cd codes.
 TZ_OFFSETS = {"AST": -4, "EST": -5, "CST": -6, "MST": -7, "PST": -8,
@@ -77,34 +81,40 @@ def site_info(site_no):
                  tz=tz or f"UTC{offset:+d}", utc_offset_h=int(offset))
 
 
-def find_gauges(state_cd, pcode="00010"):
-    """Active stream gauges in a state with instantaneous ``pcode`` data.
+def find_gauges(state_cd, pcodes=("00010", "00095")):
+    """Active stream gauges in a state with instantaneous data for any of
+    ``pcodes``.
 
-    Returns one row per site with the period of record of ``pcode`` and
-    whether the site also reports discharge / gage height.
+    Returns one row per site with ``params`` (the set of every parameter code
+    the site reports), ``periods`` (``{pcode: (begin, end)}`` dates of the
+    requested codes it has), and ``has_q`` / ``has_gh`` for discharge and
+    gage height. Filter with e.g. ``df[df.params.map({"00095"}.issubset)]``.
     """
     text = get_text(SITE_URL, dict(
-        format="rdb", stateCd=state_cd.lower(), parameterCd=pcode,
+        format="rdb", stateCd=state_cd.lower(), parameterCd=",".join(pcodes),
         hasDataTypeCd="iv", siteStatus="active", siteType="ST",
         seriesCatalogOutput="true", outputDataTypeCd="iv"))
     cat = _read_rdb(text)
     if cat.empty:
-        return pd.DataFrame(columns=["site_no", "name", "lat", "lon", "begin",
-                                     "end", "has_q", "has_gh"])
+        return pd.DataFrame(columns=["site_no", "name", "lat", "lon", "params",
+                                     "periods", "has_q", "has_gh"])
     rows = []
     for site_no, g in cat.groupby("site_no", sort=True):
-        target = g[g["parm_cd"] == pcode]
-        if target.empty:
+        params = frozenset(g["parm_cd"].dropna())
+        periods = {code: (g.loc[g["parm_cd"] == code, "begin_date"].min(),
+                          g.loc[g["parm_cd"] == code, "end_date"].max())
+                   for code in pcodes if code in params}
+        if not periods:
             continue
         rows.append({
             "site_no": site_no,
             "name": g["station_nm"].iloc[0],
             "lat": float(g["dec_lat_va"].iloc[0]),
             "lon": float(g["dec_long_va"].iloc[0]),
-            "begin": target["begin_date"].min(),
-            "end": target["end_date"].max(),
-            "has_q": bool((g["parm_cd"] == "00060").any()),
-            "has_gh": bool((g["parm_cd"] == "00065").any()),
+            "params": params,
+            "periods": periods,
+            "has_q": "00060" in params,
+            "has_gh": "00065" in params,
         })
     return pd.DataFrame(rows)
 
@@ -208,8 +218,18 @@ def channel_measurements(site_no):
     return df.sort_values("time").reset_index(drop=True)[cols]
 
 
-def fit_depth_rating(meas, since=None, min_points=10):
-    """Least-squares fit of ``depth = c_depth * Q**f_depth`` in log space.
+def _power_fit(x, y):
+    """Fit y = c * x**f in log space; return (c, f, r2)."""
+    lx, ly = np.log(x), np.log(y)
+    f, logc = np.polyfit(lx, ly, 1)
+    resid = ly - (logc + f * lx)
+    r2 = 1.0 - resid.var() / ly.var() if ly.var() > 0 else np.nan
+    return float(np.exp(logc)), float(f), float(r2)
+
+
+def fit_hydraulic_geometry(meas, since=None, min_points=10):
+    """Least-squares fits of ``depth = c_depth * Q**f_depth`` and
+    ``width = c_width * Q**f_width`` in log space.
 
     Parameters
     ----------
@@ -220,19 +240,20 @@ def fit_depth_rating(meas, since=None, min_points=10):
 
     Returns
     -------
-    dict with ``c_depth``, ``f_depth``, ``r2``, ``n`` and the ``used``
+    dict with ``c_depth``, ``f_depth``, ``r2`` (of the depth fit),
+    ``c_width``, ``f_width``, ``r2_width``, ``n`` and the ``used``
     measurements, or None if there are fewer than 3 valid measurements.
     """
-    m = meas.dropna(subset=["discharge", "depth"])
+    m = meas.dropna(subset=["discharge", "depth", "width"])
     if since is not None:
         recent = m[m["time"] >= pd.Timestamp(since, tz="UTC")]
         if len(recent) >= min_points:
             m = recent
     if len(m) < 3:
         return None
-    x, y = np.log(m["discharge"].to_numpy()), np.log(m["depth"].to_numpy())
-    f, logc = np.polyfit(x, y, 1)
-    resid = y - (logc + f * x)
-    r2 = 1.0 - resid.var() / y.var() if y.var() > 0 else np.nan
-    return {"c_depth": float(np.exp(logc)), "f_depth": float(f),
-            "r2": float(r2), "n": int(len(m)), "used": m}
+    q = m["discharge"].to_numpy()
+    c_depth, f_depth, r2 = _power_fit(q, m["depth"].to_numpy())
+    c_width, f_width, r2_width = _power_fit(q, m["width"].to_numpy())
+    return {"c_depth": c_depth, "f_depth": f_depth, "r2": r2,
+            "c_width": c_width, "f_width": f_width, "r2_width": r2_width,
+            "n": int(len(m)), "used": m}
